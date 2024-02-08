@@ -1,3 +1,7 @@
+from openai.types.chat import ChatCompletionChunk, ChatCompletion, ChatCompletionMessage
+from openai.types.chat.chat_completion import Choice
+
+from autogen.code_utils import extract_code
 from .utils.merge_deltas import merge_deltas
 from .utils.parse_partial_json import parse_partial_json
 
@@ -41,46 +45,78 @@ def run_function_calling_llm(llm, request_params):
     language = None
     code = ""
 
+    # Set the terminal text color to green
+    print("\033[32m", end="")
+    response = None
+
     for chunk in llm.completions(**request_params):
-        if "choices" not in chunk or len(chunk["choices"]) == 0:
-            # This happens sometimes
-            continue
+        # if "choices" not in chunk or len(chunk["choices"]) == 0:
+        #     # This happens sometimes
+        #     continue
+        if isinstance(chunk, ChatCompletionChunk) and chunk.choices:
+            delta = chunk["choices"][0]["delta"]
+            # Accumulate deltas
+            accumulated_deltas = merge_deltas(accumulated_deltas, delta)
 
-        delta = chunk["choices"][0]["delta"]
+            if "content" in delta and delta["content"]:
+                print(accumulated_deltas["content"], end="", flush=True)
+                yield {"type": "message", "content": delta["content"]}
 
-        # Accumulate deltas
-        accumulated_deltas = merge_deltas(accumulated_deltas, delta)
-
-        if "content" in delta and delta["content"]:
-            yield {"type": "message", "content": delta["content"]}
-
-        if (
-            accumulated_deltas.get("function_call")
-            and "arguments" in accumulated_deltas["function_call"]
-            and accumulated_deltas["function_call"]["arguments"]
-        ):
             if (
-                "name" in accumulated_deltas["function_call"]
-                and accumulated_deltas["function_call"]["name"] == "execute"
+                accumulated_deltas.get("function_call")
+                and "arguments" in accumulated_deltas["function_call"]
+                and accumulated_deltas["function_call"]["arguments"]
             ):
-                arguments = accumulated_deltas["function_call"]["arguments"]
-                arguments = parse_partial_json(arguments)
+                if (
+                    "name" in accumulated_deltas["function_call"]
+                    and accumulated_deltas["function_call"]["name"] == "execute"
+                ):
+                    arguments = accumulated_deltas["function_call"]["arguments"]
+                    arguments = parse_partial_json(arguments)
 
-                if arguments:
-                    if (
-                        language is None
-                        and "language" in arguments
-                        and "code"
-                        in arguments  # <- This ensures we're *finished* typing language, as opposed to partially done
-                        and arguments["language"]
-                    ):
-                        language = arguments["language"]
+                    if arguments:
+                        if (
+                            language is None
+                            and "language" in arguments
+                            and "code"
+                            in arguments  # <- This ensures we're *finished* typing language, as opposed to partially done
+                            and arguments["language"]
+                        ):
+                            language = arguments["language"]
 
-                    if language is not None and "code" in arguments:
-                        # Calculate the delta (new characters only)
-                        code_delta = arguments["code"][len(code) :]
+                        if language is not None and "code" in arguments:
+                            # Calculate the delta (new characters only)
+                            code_delta = arguments["code"][len(code) :]
+                            # Update the code
+                            code = arguments["code"]
+                            # Yield the delta
+                            if code_delta:
+                                yield {
+                                    "type": "code",
+                                    "format": language,
+                                    "content": code_delta,
+                                }
+                    else:
+                        if llm.interpreter.verbose:
+                            print("Arguments not a dict.")
+
+                # Common hallucinations
+                elif "name" in accumulated_deltas["function_call"] and (
+                    accumulated_deltas["function_call"]["name"] == "python"
+                    or accumulated_deltas["function_call"]["name"] == "functions"
+                ):
+                    if llm.interpreter.verbose:
+                        print("Got direct python call")
+                    if language is None:
+                        language = "python"
+
+                    if language is not None:
+                        # Pull the code string straight out of the "arguments" string
+                        code_delta = accumulated_deltas["function_call"]["arguments"][
+                            len(code) :
+                        ]
                         # Update the code
-                        code = arguments["code"]
+                        code = accumulated_deltas["function_call"]["arguments"]
                         # Yield the delta
                         if code_delta:
                             yield {
@@ -88,40 +124,37 @@ def run_function_calling_llm(llm, request_params):
                                 "format": language,
                                 "content": code_delta,
                             }
+
                 else:
-                    if llm.interpreter.verbose:
-                        print("Arguments not a dict.")
+                    # If name exists and it's not "execute" or "python" or "functions", who knows what's going on.
+                    if "name" in accumulated_deltas["function_call"]:
+                        print(
+                            "Encountered an unexpected function call: ",
+                            accumulated_deltas["function_call"],
+                            "\nPlease open an issue and provide the above info at: https://github.com/KillianLucas/open-interpreter",
+                        )
+        elif isinstance(chunk, ChatCompletion):
+            response = chunk
 
-            # Common hallucinations
-            elif "name" in accumulated_deltas["function_call"] and (
-                accumulated_deltas["function_call"]["name"] == "python"
-                or accumulated_deltas["function_call"]["name"] == "functions"
-            ):
-                if llm.interpreter.verbose:
-                    print("Got direct python call")
-                if language is None:
-                    language = "python"
+    # Reset the terminal text color
+    print("\033[0m\n")
 
-                if language is not None:
-                    # Pull the code string straight out of the "arguments" string
-                    code_delta = accumulated_deltas["function_call"]["arguments"][
-                        len(code) :
-                    ]
-                    # Update the code
-                    code = accumulated_deltas["function_call"]["arguments"]
-                    # Yield the delta
-                    if code_delta:
-                        yield {
-                            "type": "code",
-                            "format": language,
-                            "content": code_delta,
-                        }
+    if response is None:
+        response = ChatCompletion(
+            id=chunk.id,
+            model=chunk.model,
+            created=chunk.created,
+            object="chat.completion",
+            choices=[Choice(index=0, finish_reason="stop", message=ChatCompletionMessage(role=accumulated_deltas['role'], content=accumulated_deltas['content'], function_call=None), logprobs=None)],
+        )
 
-            else:
-                # If name exists and it's not "execute" or "python" or "functions", who knows what's going on.
-                if "name" in accumulated_deltas["function_call"]:
-                    print(
-                        "Encountered an unexpected function call: ",
-                        accumulated_deltas["function_call"],
-                        "\nPlease open an issue and provide the above info at: https://github.com/KillianLucas/open-interpreter",
-                    )
+    full_content = response.choices[0].message.content
+    code_blocks = extract_code(full_content) or []
+    for language, code in code_blocks:
+        if language in function_schema["parameters"]["properties"]["language"]["enum"] and code:
+            yield {
+                "type": "code",
+                "format": language,
+                "content": code,
+            }
+
